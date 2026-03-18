@@ -1,0 +1,20 @@
+# ── Sensitive / Personal ──
+session_log_prompt.md      # Your campaign-specific AI prompt (contains names)
+.processed_vtts            # Local processing state
+
+# ── Backups & outputs ──
+session_backups/           # Local backup directory
+*.vtt                      # Raw transcripts
+
+# ── Python ──
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ── macOS ──
+.DS_Store
+
+# ── IDE ──
+.vscode/
+.idea/
