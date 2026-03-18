@@ -395,27 +395,59 @@ def _hard_split(title: str, body: str, max_chars: int) -> list[dict]:
     current_buffer = ""
     part_num = 0
 
+    def make_header(part_index: int) -> str:
+        if not title:
+            return ""
+        suffix = "" if part_index == 0 else " (cont.)"
+        return f"## {title}{suffix}\n\n"
+
+    def split_oversize_line(line: str, part_index: int) -> tuple[list[str], int]:
+        pieces = []
+        remaining = line
+
+        while remaining:
+            header = make_header(part_index)
+            available = max_chars - len(header)
+            if available <= 0:
+                raise ValueError("max_chars too small to fit the chunk header")
+
+            piece = remaining[:available]
+            split_at = piece.rfind(" ")
+            if split_at > 0 and len(remaining) > available:
+                piece = piece[:split_at]
+
+            piece = piece.rstrip()
+            if not piece:
+                piece = remaining[:available]
+
+            pieces.append(f"{header}{piece}" if header else piece)
+            remaining = remaining[len(piece):].lstrip()
+            part_index += 1
+
+        return pieces, part_index
+
     for line in lines:
         if not current_buffer:
-            if part_num == 0 and title:
-                candidate = f"## {title}\n\n{line}"
-            else:
-                suffix = " (cont.)" if title else ""
-                header = f"## {title}{suffix}\n\n" if title else ""
-                candidate = f"{header}{line}"
+            candidate = f"{make_header(part_num)}{line}" if title else line
         else:
             candidate = current_buffer + "\n" + line
 
         if len(candidate) <= max_chars:
             current_buffer = candidate
-        else:
-            if current_buffer:
-                chunks.append(current_buffer)
+            continue
+
+        if current_buffer:
+            chunks.append(current_buffer)
+            current_buffer = ""
             part_num += 1
-            if title:
-                current_buffer = f"## {title} (cont.)\n\n{line}"
-            else:
-                current_buffer = line
+
+        candidate = f"{make_header(part_num)}{line}" if title else line
+        if len(candidate) <= max_chars:
+            current_buffer = candidate
+            continue
+
+        line_chunks, part_num = split_oversize_line(line, part_num)
+        chunks.extend(line_chunks)
 
     if current_buffer:
         chunks.append(current_buffer)
@@ -719,6 +751,15 @@ def upload_to_campaign_logger(
     return manifest
 
 
+def upload_fully_succeeded(manifest: dict) -> bool:
+    """Return True when every chunk upload succeeded."""
+    return (
+        manifest.get("status") != "skipped"
+        and manifest.get("failed", 0) == 0
+        and manifest.get("successful", 0) == manifest.get("total_chunks", 0)
+    )
+
+
 def save_manifest(manifest: dict, stem: str, backup_dir: Path = BACKUP_DIR):
     """Save the upload manifest to a JSON file."""
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -838,6 +879,8 @@ def process_vtt(vtt_path: Path, upload: bool = True):
     backup_paths = save_local_backup(session_log, chunks, stem)
 
     # ── Upload to Campaign Logger ──
+    should_mark_processed = True
+
     if upload and cl_api_available():
         # Prompt for session title
         session_title = prompt_for_session_title(vtt_path.name)
@@ -854,11 +897,18 @@ def process_vtt(vtt_path: Path, upload: bool = True):
             manifest = upload_to_campaign_logger(chunks, log_id=new_log_id)
             manifest["session_title"] = session_title
             save_manifest(manifest, stem)
+            should_mark_processed = upload_fully_succeeded(manifest)
             log.info(
                 f"Upload complete: {manifest['successful']}/{manifest['total_chunks']} "
                 f"successful, {manifest['failed']} failed"
             )
+            if not should_mark_processed:
+                log.warning(
+                    "Upload did not fully succeed. Leaving this VTT unprocessed "
+                    "so watch mode can retry it."
+                )
         else:
+            should_mark_processed = False
             log.error(
                 "Failed to create Log in Campaign Logger. "
                 "Chunks saved locally — you can retry with --chunk-and-upload"
@@ -870,7 +920,8 @@ def process_vtt(vtt_path: Path, upload: bool = True):
             "and CAMPAIGN_LOGGER_CAMPAIGN_ID in your environment."
         )
 
-    mark_processed(vtt_path.name)
+    if should_mark_processed:
+        mark_processed(vtt_path.name)
     log.info("Done.\n")
 
 
