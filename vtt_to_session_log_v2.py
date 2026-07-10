@@ -13,6 +13,21 @@ v2 additions:
   - Campaign Logger API upload: POSTs chunks as LogEntries (requires auth)
   - Upload manifest: JSON log of API results for troubleshooting
 
+7/10/26 -- Security/bug review pass:
+  - Detect truncated Claude responses (max_tokens) instead of silently
+    uploading a cut-off session log
+  - Guard against empty Claude response content
+  - chunk_existing_log now validates the file exists and catches read errors
+  - Unknown command-line arguments now print usage instead of silently
+    falling through to watch mode
+  - Watch mode waits for a VTT file to finish copying (size stable)
+    before processing it
+  - Watch loop no longer permanently skips a VTT whose upload failed;
+    it is retried on next script start
+  - Defensive parse of the create-log API response (non-dict JSON)
+  - Fixed VTT parsing: <v Speaker> tags were stripped before the speaker
+    regex could match them, losing speaker attribution
+
 SETUP — Local git (recommended):
   cd /path/to/this/script
   git init
@@ -130,15 +145,18 @@ def parse_vtt(vtt_text: str) -> str:
         ):
             continue
 
-        line = re.sub(r"<[^>]+>", "", line).strip()
-        if not line:
-            continue
-
+        # Match the <v Speaker> tag BEFORE stripping tags — otherwise the
+        # generic tag-strip below destroys it and the speaker is lost.
         m = speaker_tag_re.match(line)
         if m:
             flush()
             current_speaker = m.group(1).strip()
-            current_text = [m.group(2).strip()] if m.group(2).strip() else []
+            first_text = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            current_text = [first_text] if first_text else []
+            continue
+
+        line = re.sub(r"<[^>]+>", "", line).strip()
+        if not line:
             continue
 
         m = speaker_colon_re.match(line)
@@ -196,7 +214,8 @@ def parse_scenes(markdown_text: str) -> list[dict]:
 
     Returns a list of dicts: [{"title": str, "body": str}, ...]
     Title comes from the ## heading line. Body is everything until the next ##.
-    Content before the first ## heading (if any) gets title "Preamble".
+    Content before the first ## heading (if any) gets an empty title and is
+    chunked without a heading.
     """
     lines = markdown_text.split("\n")
     scenes = []
@@ -638,10 +657,17 @@ def create_cl_log(
         if resp.status_code in (200, 201):
             try:
                 data = resp.json()
-                # The response structure may vary — try common patterns
+                # The response structure may vary — try common patterns.
+                # Guard: a non-dict JSON body (e.g. a bare list) would crash
+                # .get() with an AttributeError, which ValueError won't catch.
+                if not isinstance(data, dict):
+                    data = {}
+                nested = data.get("data")
+                if not isinstance(nested, dict):
+                    nested = {}
                 log_id = (
                     data.get("id")
-                    or data.get("data", {}).get("id")
+                    or nested.get("id")
                     or data.get("stringId")
                 )
                 if log_id:
@@ -796,6 +822,22 @@ def convert_to_session_log(transcript: str, filename: str) -> str:
         ],
     )
 
+    # Guard: the API can return an empty content list in edge cases
+    # (e.g. the model produced no text). Fail loudly rather than crash
+    # with an IndexError.
+    if not message.content or not getattr(message.content[0], "text", ""):
+        raise RuntimeError("Claude returned an empty response — no session log text.")
+
+    # Guard: if the model ran out of output tokens, the session log is
+    # cut off mid-sentence. Fail loudly so a truncated log is never
+    # chunked and uploaded to Campaign Logger.
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError(
+            "Claude response was truncated (hit the max_tokens limit). "
+            "The session log is incomplete. Increase max_tokens in "
+            "convert_to_session_log() and re-run."
+        )
+
     return message.content[0].text
 
 
@@ -812,23 +854,56 @@ def mark_processed(filename: str):
         f.write(filename + "\n")
 
 
-def process_vtt(vtt_path: Path, upload: bool = True):
-    """Full pipeline: VTT → parse → Claude → normalize → chunk → save → upload."""
+def wait_for_stable_file(vtt_path: Path, interval: float = 2.0, max_wait: float = 60.0) -> bool:
+    """Wait until the file's size stops changing between checks.
+
+    A VTT dropped into the watch directory may still be mid-copy when the
+    watch loop first sees it. Processing a half-copied file produces a
+    garbage transcript. Returns True once the size is stable and non-zero,
+    False if the file disappears or never stabilizes within max_wait seconds.
+    """
+    last_size = -1
+    waited = 0.0
+    while waited <= max_wait:
+        try:
+            size = vtt_path.stat().st_size
+        except OSError:
+            return False
+        if size == last_size and size > 0:
+            return True
+        last_size = size
+        time.sleep(interval)
+        waited += interval
+    log.warning(f"{vtt_path.name}: size still changing after {max_wait}s.")
+    return False
+
+
+def process_vtt(vtt_path: Path, upload: bool = True) -> bool:
+    """Full pipeline: VTT → parse → Claude → normalize → chunk → save → upload.
+
+    Returns True when the file was fully processed (and marked as such),
+    False when it failed partway and should be retried on next script start.
+    """
     # Validate the file is actually within the watch directory
     try:
         vtt_path.resolve().relative_to(WATCH_DIR.resolve())
     except ValueError:
         log.error(f"Security: {vtt_path} is outside the watch directory. Skipping.")
-        return
+        return False
 
     log.info(f"Found: {vtt_path.name}")
+
+    # Wait for the file to finish copying before reading it
+    if not wait_for_stable_file(vtt_path):
+        log.error(f"{vtt_path.name}: file not stable or unreadable. Will retry.")
+        return False
 
     # ── Read VTT ──
     try:
         raw = vtt_path.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         log.error(f"Error reading file: {e}")
-        return
+        return False
 
     # ── Parse VTT ──
     log.info("Parsing VTT...")
@@ -845,7 +920,7 @@ def process_vtt(vtt_path: Path, upload: bool = True):
     except Exception as e:
         log.error(f"Error calling Claude API: {e}")
         log.error("Make sure ANTHROPIC_API_KEY is set in your environment.")
-        return
+        return False
 
     # ── Normalize markdown for Campaign Logger ──
     log.info("Normalizing markdown (* → _ for CL compatibility)...")
@@ -863,7 +938,7 @@ def process_vtt(vtt_path: Path, upload: bool = True):
         log.info(f"Session log saved: {out_path.name}")
     except Exception as e:
         log.error(f"Error saving output: {e}")
-        return
+        return False
 
     # ── Chunk for Campaign Logger ──
     log.info(f"Chunking session log (max {MAX_ENTRY_CHARS} chars/entry)...")
@@ -905,7 +980,7 @@ def process_vtt(vtt_path: Path, upload: bool = True):
             if not should_mark_processed:
                 log.warning(
                     "Upload did not fully succeed. Leaving this VTT unprocessed "
-                    "so watch mode can retry it."
+                    "so it is retried on the next script start."
                 )
         else:
             should_mark_processed = False
@@ -923,6 +998,7 @@ def process_vtt(vtt_path: Path, upload: bool = True):
     if should_mark_processed:
         mark_processed(vtt_path.name)
     log.info("Done.\n")
+    return should_mark_processed
 
 
 # ── Standalone Utilities ─────────────────────────────────────────────────────
@@ -937,9 +1013,18 @@ def chunk_existing_log(md_path: Path, upload: bool = False):
         python vtt_to_session_log_v2.py --chunk path/to/session.md
         python vtt_to_session_log_v2.py --chunk-and-upload path/to/session.md
     """
+    # Validate the input file before doing anything else
+    if not md_path.is_file():
+        log.error(f"File not found (or not a file): {md_path}")
+        return
+
     log.info(f"Processing existing log: {md_path.name}")
 
-    text = md_path.read_text(encoding="utf-8")
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        log.error(f"Error reading file: {e}")
+        return
 
     # Normalize markdown
     log.info("Normalizing markdown...")
@@ -988,6 +1073,17 @@ def chunk_existing_log(md_path: Path, upload: bool = False):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def print_usage():
+    # Prints command-line usage. Shared by --help and bad-argument handling.
+    print("Usage:")
+    print("  python vtt_to_session_log_v2.py           "
+          "  # Watch mode (default)")
+    print("  python vtt_to_session_log_v2.py --chunk FILE.md    "
+          "  # Chunk existing log")
+    print("  python vtt_to_session_log_v2.py --chunk-and-upload FILE.md "
+          "# Chunk + upload")
+
+
 def main():
     # Handle utility modes
     if len(sys.argv) > 1:
@@ -998,14 +1094,14 @@ def main():
             chunk_existing_log(Path(sys.argv[2]), upload=True)
             return
         elif sys.argv[1] in ("--help", "-h"):
-            print("Usage:")
-            print("  python vtt_to_session_log_v2.py           "
-                  "  # Watch mode (default)")
-            print("  python vtt_to_session_log_v2.py --chunk FILE.md    "
-                  "  # Chunk existing log")
-            print("  python vtt_to_session_log_v2.py --chunk-and-upload FILE.md "
-                  "# Chunk + upload")
+            print_usage()
             return
+        else:
+            # Unknown argument, or --chunk/--chunk-and-upload without a file.
+            # Print usage and stop instead of silently entering watch mode.
+            print(f"Unrecognized or incomplete arguments: {' '.join(sys.argv[1:])}")
+            print_usage()
+            sys.exit(1)
 
     # Watch mode — check for API key
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -1029,7 +1125,10 @@ def main():
 
     processed = load_processed()
 
-    # Process existing unprocessed VTTs on startup
+    # Process existing unprocessed VTTs on startup.
+    # Note: files are added to the in-session set even on failure so a bad
+    # file isn't retried every poll (burning API calls). Failed files are
+    # not written to .processed_vtts, so they retry on next script start.
     for vtt_file in sorted(WATCH_DIR.glob("*.vtt")):
         if vtt_file.name not in processed:
             process_vtt(vtt_file)

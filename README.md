@@ -130,6 +130,12 @@ The script uses CL's v3 API with `api-client` and `api-secret` header authentica
 
 If the API isn't configured, the script still works — it just skips the upload step and saves everything locally.
 
+## Failure & Retry Behavior
+
+- **Mid-copy protection:** watch mode waits until a `.vtt` file's size stops changing before processing it, so a file still being copied in won't produce a garbage transcript.
+- **Failed uploads retry on restart:** if creating the Log or uploading any chunk fails, the VTT is *not* marked processed. It won't be retried within the same run (to avoid burning API calls in a loop), but it will be picked up again the next time the script starts. Chunks are always saved locally regardless.
+- **Truncation guard:** if Claude's response hits the output token limit, the script aborts that file with an error rather than uploading a cut-off session log. If this happens, increase `max_tokens` in `convert_to_session_log()` and re-run.
+
 ## License
 
 Do whatever you want with it. If you find it useful, that's great.
