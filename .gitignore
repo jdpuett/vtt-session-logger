@@ -1,10 +1,14 @@
 # ── Sensitive / Personal ──
-session_log_prompt.md      # Your campaign-specific AI prompt (contains names)
-.processed_vtts            # Local processing state
+# Your campaign-specific AI prompt (contains names)
+session_log_prompt.md
+# Local processing state
+.processed_vtts
 
 # ── Backups & outputs ──
-session_backups/           # Local backup directory
-*.vtt                      # Raw transcripts
+# Local backup directory
+session_backups/
+# Raw transcripts
+*.vtt
 
 # ── Python ──
 __pycache__/
